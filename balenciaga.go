@@ -28,6 +28,8 @@ how to pick
 stategies
 - Round robin (all weights are equal)
 - Weighted round robin (higher weight receives more requests )
+
+NOT HERE:
 - Least connections (useful when large number of persistent connections)
 - IP hash (connects to the same server to get the same session)
 - URL hash (good for caching)
@@ -223,12 +225,10 @@ func NewConfig() Config {
 }
 
 func main() {
-
 	var lb *LoadBalancer
-	var nodePool = &NodePool{}
-
 	config := NewConfig()
 
+	var nodePool = &NodePool{}
 	for _, nodeUrl := range config.Nodes {
 		proxy := httputil.NewSingleHostReverseProxy(nodeUrl)
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
@@ -259,7 +259,6 @@ func main() {
 		}
 
 		nodePool.AddNode(n)
-
 	}
 
 	lb = &LoadBalancer{
