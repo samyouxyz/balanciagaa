@@ -5,10 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,14 +21,18 @@ import (
 
 request --> proxy -> pick a node
 
-stategies
-- Round robin
-- Weighted round robin (todo maybe)
-- Least connections (todo maybe)
-
 how to pick
 - cycle through all nodes
 - exclude dead node
+
+stategies
+- Round robin (all weights are equal)
+- Weighted round robin (higher weight receives more requests )
+- Least connections (useful when large number of persistent connections)
+- IP hash (connects to the same server to get the same session)
+- URL hash (good for caching)
+- Least reponse Time (pick the fastest)
+- Least bandwidth (pick the least traffic in Mbps)
 
 */
 
@@ -41,6 +47,7 @@ type Node struct {
 	URL          *url.URL
 	Alive        bool
 	ReverseProxy *httputil.ReverseProxy
+	Weight       uint64
 	mux          sync.RWMutex
 }
 
@@ -51,14 +58,16 @@ func (n *Node) SetAlive(alive bool) {
 }
 
 type NodePool struct {
-	nodes   []*Node
-	current uint64
+	nodes        []*Node
+	currentIndex uint64
+	totalWeight  uint64
 }
 
 type Config struct {
-	Addr     string
-	Port     int
-	NodeList string
+	Addr    string
+	Port    int
+	Nodes   []*url.URL
+	Weights []int
 }
 
 type LoadBalancer struct {
@@ -66,32 +75,33 @@ type LoadBalancer struct {
 	pool   *NodePool
 }
 
-func (np *NodePool) NextIndex() int {
-	return int(atomic.AddUint64(&np.current, uint64(1)) % uint64(len(np.nodes)))
-
-}
-
 func (np *NodePool) AddNode(node *Node) {
 	np.nodes = append(np.nodes, node)
+	np.totalWeight += node.Weight
 }
 
 func (np *NodePool) GetNextNode() *Node {
-	nextIdx := np.NextIndex()
+	nextIdx := int(atomic.AddUint64(&np.currentIndex, uint64(1)) % uint64(len(np.nodes)))
 	k := len(np.nodes) + nextIdx
+	pick := rand.Intn(int(np.totalWeight))
 
 	for i := nextIdx; i < k; i++ {
 		idx := i % len(np.nodes)
 		node := np.nodes[idx]
-		if node.Alive {
-			atomic.StoreUint64(&np.current, uint64(idx))
-			return node
-		}
 
+		pick -= int(node.Weight)
+		if pick < 0 {
+			if node.Alive {
+				atomic.StoreUint64(&np.currentIndex, uint64(idx))
+				return node
+			}
+		}
 	}
+
 	return nil
 }
 
-func isBackendAlive(u *url.URL) bool {
+func checkNodeAlive(u *url.URL) bool {
 	timeout := 2 * time.Second
 	conn, err := net.DialTimeout("tcp", u.Host, timeout)
 	if err != nil {
@@ -104,7 +114,7 @@ func isBackendAlive(u *url.URL) bool {
 
 func (np *NodePool) HealthCheck() {
 	for _, node := range np.nodes {
-		alive := isBackendAlive(node.URL)
+		alive := checkNodeAlive(node.URL)
 		node.SetAlive(alive)
 		log.Printf("%s alive status: %v", node.URL.Host, alive)
 	}
@@ -160,23 +170,55 @@ func GetAttempsFromContext(r *http.Request) int {
 }
 
 func NewConfig() Config {
-	var nodes string
 	var addr string
 	var port int
+	var nodeList string
+	var weightList string
 
-	flag.StringVar(&nodes, "nodes", "", "server node URLs. use comma separated.")
-	flag.StringVar(&addr, "addr", "localhost", "load balancer port")
+	flag.StringVar(&nodeList, "nodes", "", "server node URLs. use comma separated.")
+	flag.StringVar(&weightList, "weights", "", "weights for the corresponding nodes. use comma separated.")
+	flag.StringVar(&addr, "addr", "localhost", "load balancer address")
 	flag.IntVar(&port, "port", 3030, "load balancer port")
 	flag.Parse()
 
-	if len(nodes) == 0 {
+	if len(nodeList) == 0 {
 		log.Fatal("Require url of nodes to be added to pool")
 	}
 
+	var urls []*url.URL
+	for _, u := range strings.Split(nodeList, ",") {
+		nodeUrl, err := url.Parse(u)
+		if err != nil {
+			log.Fatalf("error parsing node URL: %v", err)
+		}
+		urls = append(urls, nodeUrl)
+	}
+
+	var weights []int
+	if len(weightList) == 0 {
+		for range urls {
+			weights = append(weights, 1)
+		}
+	} else {
+		wlist := strings.Split(weightList, ",")
+		if len(weightList) != 0 && len(urls) != len(wlist) {
+			log.Fatal("Nodes and weights mismatch")
+		}
+
+		for _, w := range wlist {
+			weight, err := strconv.Atoi(w)
+			if err != nil {
+				log.Fatalf("error converting weight to int: %v", err)
+			}
+			weights = append(weights, weight)
+		}
+	}
+
 	return Config{
-		Addr:     "",
-		Port:     port,
-		NodeList: nodes,
+		Addr:    addr,
+		Port:    port,
+		Nodes:   urls,
+		Weights: weights,
 	}
 }
 
@@ -187,14 +229,7 @@ func main() {
 
 	config := NewConfig()
 
-	urls := strings.Split(config.NodeList, ",")
-
-	for _, u := range urls {
-		nodeUrl, err := url.Parse(u)
-		if err != nil {
-			log.Fatalf("error parsing node URL: %v", err)
-		}
-
+	for _, nodeUrl := range config.Nodes {
 		proxy := httputil.NewSingleHostReverseProxy(nodeUrl)
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
 			log.Printf("[%s] %s\n", nodeUrl.Host, e.Error())
@@ -238,7 +273,9 @@ func main() {
 	}
 
 	go healthCheck(lb)
+	fmt.Println("Started healthcheck.")
 
+	fmt.Printf("Load balancer start. Listening at %s:%d", config.Addr, config.Port)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("fail to start server: %v", err)
 	}
