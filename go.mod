@@ -1,3 +1,3 @@
-module github.com/samyouxyz/balenciaga
+module github.com/samyouxyz/balanciagaa
 
 go 1.22.1
